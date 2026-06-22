@@ -87,6 +87,8 @@ defmodule Bonny.ControllerV2 do
 
   use Supervisor
 
+  require Logger
+
   @type api :: binary()
   @type resource :: binary()
   @type verb :: binary()
@@ -130,16 +132,20 @@ defmodule Bonny.ControllerV2 do
     operator = Keyword.fetch!(init_args, :operator)
     reconcile_timeout = Keyword.get(init_args, :reconcile_timeout, 5_000)
     termination_delay = Keyword.get(init_args, :termination_delay, 60_000)
+    halt_on_error = Keyword.get(init_args, :halt_on_error, true)
     conn = Keyword.get_lazy(init_args, :conn, fn -> Bonny.Config.conn() end)
 
-    watcher_stream =
-      Bonny.Server.Watcher.get_raw_stream(conn, ensure_watch_query(query))
-      |> Stream.map(&Bonny.Operator.run(&1, controller, operator, conn))
+    watcher_stream = build_watcher_stream(conn, query, controller, operator)
 
     reconciler_stream =
-      conn
-      |> Bonny.Server.Reconciler.get_raw_stream(ensure_list_query(query))
-      |> Task.async_stream(&Bonny.Operator.run({:reconcile, &1}, controller, operator, conn),[timeout: reconcile_timeout])
+      build_reconciler_stream(
+        Bonny.Server.Reconciler.get_raw_stream(conn, ensure_list_query(query)),
+        controller,
+        operator,
+        conn,
+        reconcile_timeout: reconcile_timeout,
+        halt_on_error: halt_on_error
+      )
 
     children = [
       {Bonny.Server.AsyncStreamRunner, id: Watcher, stream: watcher_stream},
@@ -152,6 +158,45 @@ defmodule Bonny.ControllerV2 do
       strategy: :one_for_one,
       max_restarts: 20,
       max_seconds: 120
+    )
+  end
+
+  @doc false
+  def build_watcher_stream(conn, query, controller, operator) do
+    Bonny.Server.Watcher.get_raw_stream(conn, ensure_watch_query(query))
+    |> Stream.map(&Bonny.Operator.run(&1, controller, operator, conn))
+  end
+
+  @doc false
+  def build_reconciler_stream(resource_stream, controller, operator, conn, opts \\ []) do
+    reconcile_timeout = Keyword.get(opts, :reconcile_timeout, 5_000)
+    halt_on_error = Keyword.get(opts, :halt_on_error, true)
+    max_concurrency = Keyword.get(opts, :max_concurrency, System.schedulers_online())
+
+    Task.async_stream(
+      resource_stream,
+      fn resource ->
+        try do
+          Bonny.Operator.run({:reconcile, resource}, controller, operator, conn)
+        rescue
+          error ->
+            if halt_on_error, do: reraise(error, __STACKTRACE__)
+
+            Logger.error("Reconcile failed (continuing list pass)",
+              name: K8s.Resource.name(resource),
+              namespace: K8s.Resource.namespace(resource),
+              kind: K8s.Resource.kind(resource),
+              api_version: resource["apiVersion"],
+              error: error,
+              stacktrace: __STACKTRACE__,
+              library: :bonny
+            )
+
+            :error
+        end
+      end,
+      timeout: reconcile_timeout,
+      max_concurrency: max_concurrency
     )
   end
 
